@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Least privilege reusable S3/ECR sanitation automation (deletes S3
+  files older than 10 days, ECR skips "latest" tag, every 10 days)
+
+Parameters:
+  S3Bucket1:
+    Type: String
+    Default: ''
+  S3Bucket2:
+    Type: String
+    Default: ''
+  S3Bucket3:
+    Type: String
+    Default: ''
+  ECRRepo1:
+    Type: String
+    Default: ''
+  ECRRepo2:
+    Type: String
+    Default: ''
+  ECRRepo3:
+    Type: String
+    Default: ''
+
+Conditions:
+  HasS3Bucket1: !Not
+    - !Equals
+      - !Ref S3Bucket1
+      - ''
+  HasS3Bucket2: !Not
+    - !Equals
+      - !Ref S3Bucket2
+      - ''
+  HasS3Bucket3: !Not
+    - !Equals
+      - !Ref S3Bucket3
+      - ''
+  HasECRRepo1: !Not
+    - !Equals
+      - !Ref ECRRepo1
+      - ''
+  HasECRRepo2: !Not
+    - !Equals
+      - !Ref ECRRepo2
+      - ''
+  HasECRRepo3: !Not
+    - !Equals
+      - !Ref ECRRepo3
+      - ''
+
+Resources:
+
+  CleanupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !If
+                    - HasS3Bucket1
+                    - !Sub arn:aws:s3:::${S3Bucket1}
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasS3Bucket2
+                    - !Sub arn:aws:s3:::${S3Bucket2}
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasS3Bucket3
+                    - !Sub arn:aws:s3:::${S3Bucket3}
+                    - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:GetObject
+                Resource:
+                  - !If
+                    - HasS3Bucket1
+                    - !Sub arn:aws:s3:::${S3Bucket1}/*
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasS3Bucket2
+                    - !Sub arn:aws:s3:::${S3Bucket2}/*
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasS3Bucket3
+                    - !Sub arn:aws:s3:::${S3Bucket3}/*
+                    - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - ecr:ListImages
+                  - ecr:BatchDeleteImage
+                  - ecr:DescribeImages
+                Resource:
+                  - !If
+                    - HasECRRepo1
+                    - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepo1}
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasECRRepo2
+                    - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepo2}
+                    - !Ref AWS::NoValue
+                  - !If
+                    - HasECRRepo3
+                    - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepo3}
+                    - !Ref AWS::NoValue
+
+  S3CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CleanupLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKETS: !Join
+            - ','
+            - - !If
+                - HasS3Bucket1
+                - !Ref S3Bucket1
+                - ''
+              - !If
+                - HasS3Bucket2
+                - !Ref S3Bucket2
+                - ''
+              - !If
+                - HasS3Bucket3
+                - !Ref S3Bucket3
+                - ''
+      Code:
+        ZipFile: |
+          import os, boto3, time
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              now = time.time()
+              cutoff = now - 10*24*60*60
+              buckets = [b.strip() for b in os.environ.get('BUCKETS','').split(',') if b.strip()]
+              deleted = []
+              for bucket in buckets:
+                  paginator = s3.get_paginator('list_objects_v2')
+                  for page in paginator.paginate(Bucket=bucket):
+                      for obj in page.get('Contents', []):
+                          # Example: skip objects with prefix "in_use/"
+                          if obj['Key'].startswith("in_use/"):
+                              continue
+                          # Only delete if object is older than cutoff
+                          if obj['LastModified'].timestamp() < cutoff:
+                              s3.delete_object(Bucket=bucket, Key=obj['Key'])
+                              deleted.append({'bucket': bucket, 'key': obj['Key']})
+              print(f"Deleted: {deleted}")
+              return {'deleted': deleted}
+
+  ECRCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CleanupLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          REPOS: !Join
+            - ','
+            - - !If
+                - HasECRRepo1
+                - !Ref ECRRepo1
+                - ''
+              - !If
+                - HasECRRepo2
+                - !Ref ECRRepo2
+                - ''
+              - !If
+                - HasECRRepo3
+                - !Ref ECRRepo3
+                - ''
+      Code:
+        ZipFile: |
+          import os, boto3, time
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              now = time.time()
+              cutoff = now - 10*24*60*60
+              buckets = [b.strip() for b in os.environ.get('BUCKETS','').split(',') if b.strip()]
+              prefixes = ["mixed/", "narration_chunks/"]
+              deleted = []
+              for bucket in buckets:
+                  paginator = s3.get_paginator('list_objects_v2')
+                  for prefix in prefixes:
+                      for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                          for obj in page.get('Contents', []):
+                              # Only delete if object is older than cutoff
+                              if obj['LastModified'].timestamp() < cutoff:
+                                  s3.delete_object(Bucket=bucket, Key=obj['Key'])
+                                  deleted.append({'bucket': bucket, 'key': obj['Key']})
+              print(f"Deleted: {deleted}")
+              return {'deleted': deleted}
+
+  CleanupScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(10 days)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt S3CleanupFunction.Arn
+          Id: S3CleanupTarget
+        - Arn: !GetAtt ECRCleanupFunction.Arn
+          Id: ECRCleanupTarget
+
+  S3CleanupInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3CleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupScheduleRule.Arn
+
+  ECRCleanupInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ECRCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupScheduleRule.Arn
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-bucket-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+      PublicAccessBlockConfiguration:
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BucketBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Id: RequireEncryptionInTransit
+        Version: '2012-10-17'
+        Statement:
+          - Principal: '*'
+            Action: '*'
+            Effect: Deny
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub ${Bucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+Outputs:
+  S3CleanupFunctionArn:
+    Description: ARN of S3 Cleanup Lambda
+    Value: !GetAtt S3CleanupFunction.Arn
+  ECRCleanupFunctionArn:
+    Description: ARN of ECR Cleanup Lambda
+    Value: !GetAtt ECRCleanupFunction.Arn

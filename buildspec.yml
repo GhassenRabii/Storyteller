@@ -1,0 +1,24 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws --version
+      - ECR_REPO=${ECR_REPO:-<REPLACE_ME_WITH_ECR_URI>}
+      - echo $ECR_REPO
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO
+
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the Docker image...
+      - docker build -t $ECR_REPO:latest .
+      - docker tag $ECR_REPO:latest $ECR_REPO:$CODEBUILD_RESOLVED_SOURCE_VERSION
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - docker push $ECR_REPO:latest
+      - docker push $ECR_REPO:$CODEBUILD_RESOLVED_SOURCE_VERSION
+artifacts:
+  files: '**/*'

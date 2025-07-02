@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Polly Speech API (Lambda + API Gateway)
+Resources:
+  PollyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PollyLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: polly:SynthesizeSpeech
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::mixeroutputbucket
+                  - arn:aws:s3:::mixeroutputbucket/*
+  PollyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt PollyLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 2048
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: mixeroutputbucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import re
+          import uuid
+          import os
+          import logging
+          import concurrent.futures
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          polly = boto3.client('polly')
+          s3 = boto3.client('s3')
+
+          MAX_CHARS = 650
+          OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]  # Set in Lambda env vars
+
+          def preprocess_text(text):
+            """
+            Prepares input text for Amazon Polly SSML by:
+            - Expanding common abbreviations and honorifics.
+            - Ensuring ending punctuation.
+            - Inserting <break> tags after key punctuation, using custom timings.
+            - Cleaning up extra whitespace and repeated breaks.
+            - Logs all major steps for debugging and auditability.
+            """
+            logger.info(f"[PREPROCESS] Original text: {text[:100]}{'...' if len(text) > 100 else ''}")
+
+            # Clean whitespace
+            text = text.strip()
+            text = re.sub(r'\s+', ' ', text)
+            logger.info(f"[PREPROCESS] Whitespace cleaned. Length: {len(text)}")
+
+            # Always end with a sentence-ending punctuation
+            if not text.endswith(('.', '!', '?')):
+                text += '.'
+                logger.info("[PREPROCESS] Appended missing sentence-ending punctuation.")
+
+            # Expand common honorifics and abbreviations (not inside a word)
+            abbr_map = {
+                r'\bDr\.': 'Doctor',
+                r'\bMr\.': 'Mister',
+                r'\bMrs\.': 'Misses',
+                r'\bMs\.': 'Miss',
+                r'\bProf\.': 'Professor',
+                r'\bSt\.': 'Saint',
+                r'\bJr\.': 'Junior',
+                r'\bSr\.': 'Senior',
+                r'\bLt\.': 'Lieutenant',
+                r'\bCol\.': 'Colonel',
+                r'\bGen\.': 'General',
+                r'\bRep\.': 'Representative',
+                r'\bSen\.': 'Senator',
+                r'\bGov\.': 'Governor',
+                r'\bPres\.': 'President',
+                r'\bU\.S\.A\.': 'USA',
+                r'\bU\.S\.': 'US',
+                r'\bU\.K\.': 'UK',
+            }
+            for abbr, full in abbr_map.items():
+                if re.search(abbr, text):
+                    logger.info(f"[PREPROCESS] Expanding abbreviation: {abbr} -> {full}")
+                text = re.sub(abbr, full, text)
+
+            # Add custom breaks for sentence-ending punctuation
+            before_breaks = text
+            text = re.sub(r'(\.)(\s+)(?=[A-Z0-9"\'])', r'. <break time="1000ms"/>\2', text)
+            text = re.sub(r'(:)(\s+)(?=[A-Z0-9"\'])', r': <break time="500ms"/>\2', text)
+            text = re.sub(r'(;)(\s+)(?=[A-Z0-9"\'])', r'; <break time="500ms"/>\2', text)
+            text = re.sub(r'(!)(\s+)(?=[A-Z0-9"\'])', r'! <break time="800ms"/>\2', text)
+            text = re.sub(r'(\?)(\s+)(?=[A-Z0-9"\'])', r'? <break time="700ms"/>\2', text)
+            logger.info(f"[PREPROCESS] Sentence-ending breaks inserted.")
+
+            # Add short break after commas (optional, adjust ms as you like)
+            if ',' in text:
+                logger.info(f"[PREPROCESS] Adding 200ms break after commas.")
+            text = text.replace(",", ", <break time=\"200ms\"/>")
+
+            # Cleanup: remove accidental duplicate breaks and double spaces
+            text = re.sub(r'(<break time="[\d]+ms"\/>\s*)+', r'\1', text)
+            text = re.sub(r'\s{2,}', ' ', text)
+            logger.info(f"[PREPROCESS] Cleaned up breaks and whitespace.")
+
+            # Wrap with <speak> tags for SSML
+            ssml = f"<speak>{text}</speak>"
+            logger.info(f"[PREPROCESS] Final SSML length: {len(ssml)}")
+            return ssml
+
+
+          def split_text(text, max_length=MAX_CHARS):
+              logger.info(f"[SPLIT] Splitting text into <= {max_length} char chunks.")
+              sentences = re.split(r'(?<=[.!?]) +', text)
+              chunks = []
+              current = ""
+              for s in sentences:
+                  if len(current) + len(s) + 1 <= max_length:
+                      current += (" " if current else "") + s
+                  else:
+                      if current:
+                          chunks.append(current)
+                          logger.info(f"[SPLIT] Chunk {len(chunks)}: {len(current)} chars.")
+                      current = s
+              if current:
+                  chunks.append(current)
+                  logger.info(f"[SPLIT] Chunk {len(chunks)}: {len(current)} chars.")
+              logger.info(f"[SPLIT] Total chunks: {len(chunks)}")
+              return chunks
+
+          def synthesize_and_upload(chunk, idx, voice_id):
+              try:
+                  logger.info(f"[POLLY] Synthesizing chunk {idx+1} (length: {len(chunk)})")
+                  ssml_text = preprocess_text(chunk)
+                  response = polly.synthesize_speech(
+                      OutputFormat='mp3',
+                      Text=ssml_text,
+                      VoiceId=voice_id,
+                      TextType='ssml',
+                      Engine='generative'
+                  )
+                  temp_file = f"/tmp/chunk_{uuid.uuid4()}.mp3"
+                  with open(temp_file, "wb") as f:
+                      f.write(response['AudioStream'].read())
+                  s3_key = f"narration_chunks/{uuid.uuid4()}.mp3"
+                  s3.upload_file(temp_file, OUTPUT_BUCKET, s3_key)
+                  os.remove(temp_file)
+                  logger.info(f"[S3] Uploaded chunk {idx+1} to s3://{OUTPUT_BUCKET}/{s3_key}")
+                  return {"idx": idx, "s3_key": s3_key, "error": None}
+              except Exception as chunk_exc:
+                  err_msg = f"[ERROR] Polly chunk {idx+1}: {chunk_exc}"
+                  logger.error(err_msg)
+                  return {"idx": idx, "s3_key": None, "error": err_msg}
+
+          def handler(event, context):
+              logger.info("=== Lambda event received ===")
+              logger.info(json.dumps(event)[:800])  # Avoid logging huge event bodies
+
+              try:
+                  body = json.loads(event['body'])
+                  raw_text = body.get('text', '')
+                  voice_id = body.get('voice', 'Joanna')
+                  logger.info(f"[INPUT] Text length: {len(raw_text)}, Voice: {voice_id}")
+
+                  # Split and synthesize in parallel
+                  text_chunks = split_text(raw_text, MAX_CHARS)
+                  results = []
+
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                      futures = [
+                          executor.submit(synthesize_and_upload, chunk, idx, voice_id)
+                          for idx, chunk in enumerate(text_chunks)
+                      ]
+                      for future in concurrent.futures.as_completed(futures):
+                          results.append(future.result())
+
+                  # Sort results by idx to preserve correct order
+                  results_sorted = sorted([r for r in results if r["s3_key"]], key=lambda x: x["idx"])
+                  s3_keys = [r["s3_key"] for r in results_sorted]
+                  chunk_errors = [r["error"] for r in results if r["error"]]
+
+                  # Sanity check
+                  if len(s3_keys) != len(text_chunks):
+                      logger.warning(f"[MISSING_CHUNKS] Expected {len(text_chunks)} chunks, got {len(s3_keys)}.")
+                  logger.info(f"[CHUNKS] Returned {len(s3_keys)} chunk keys, order: {s3_keys}")
+
+                  result = {
+                      'chunk_keys': s3_keys,
+                      'bucket': OUTPUT_BUCKET
+                  }
+
+                  # If you want to return audio_base64 for single chunk:
+                  if len(s3_keys) == 1:
+                      logger.info("[RETURN] Returning single chunk as base64 (and chunk_keys/bucket).")
+                      s3_object = s3.get_object(Bucket=OUTPUT_BUCKET, Key=s3_keys[0])
+                      audio_stream = s3_object['Body'].read()
+                      audio_b64 = base64.b64encode(audio_stream).decode('utf-8')
+                      result['audio_base64'] = audio_b64
+
+                  if chunk_errors:
+                      result['warnings'] = chunk_errors
+                      logger.warning(f"[WARNINGS] {chunk_errors}")
+
+                  logger.info("[SUCCESS] Polly Lambda completed successfully.")
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps(result)
+                  }
+              except Exception as e:
+                  logger.error(f"[FATAL ERROR] {e}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+  PollyApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: PollySpeechAPI
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+  PollyApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PollyApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PollyLambdaFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+  PollyApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PollyApi
+      RouteKey: POST /synthesize
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref PollyApiIntegration
+  PollyApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PollyApi
+      StageName: prod
+      AutoDeploy: true
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PollyLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PollyApi}/*/*
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL
+    Value: !Sub https://${PollyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/synthesize
+    Export:
+      Name: PollySpeechApiUrl

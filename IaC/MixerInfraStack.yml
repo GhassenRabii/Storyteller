@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Mixer Infra Stack: ECR, CodeBuild, CodePipeline'
+
+Parameters:
+  MusicBucketName:
+    Type: String
+    Description: S3 bucket for background music
+    Default: ''
+  GitHubOwner:
+    Type: String
+    Default: GhassenRabii
+  GitHubRepo:
+    Type: String
+    Default: Mixer
+  GitHubBranch:
+    Type: String
+    Default: main
+  GitHubConnectionArn:
+    Type: String
+    Description: CodeStar GitHub connection ARN
+    Default: arn:aws:codeconnections:eu-central-1:626635412937:connection/932e80d0-3b3b-4103-87bd-d7ad68356230
+
+Resources:
+  MixerECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: mixer-lambda-repo
+
+  MixerOutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: mixeroutputbucket
+
+  MixerCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: '*'
+
+  MixerCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: mixer-lambda-codebuild
+      Source:
+        Type: GITHUB
+        Location: !Sub https://github.com/${GitHubOwner}/${GitHubRepo}.git
+        BuildSpec: buildspec.yml
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO
+            Value: !GetAtt MixerECRRepo.RepositoryUri
+      ServiceRole: !GetAtt MixerCodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+  MixerCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:*
+                  - codepipeline:*
+                  - codestar-connections:*
+                  - s3:*
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:ListRoles
+                  - ecr:*
+                  - logs:*
+                  - lambda:*
+                  - cloudwatch:*
+                  - ec2:Describe*
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: '*'
+
+  MixerCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: mixer-lambda-pipeline
+      RoleArn: !GetAtt MixerCodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref MixerOutputBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub_Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref GitHubBranch
+                DetectChanges: true
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref MixerCodeBuildProject
+
+Outputs:
+  MixerECRRepoUri:
+    Description: ECR repository for Lambda container
+    Value: !GetAtt MixerECRRepo.RepositoryUri
+    Export:
+      Name: MixerEcrRepoUri
+  MixerOutputBucket:
+    Description: S3 Bucket for mixed files
+    Value: !Ref MixerOutputBucket
+    Export:
+      Name: mixeroutputbucket
